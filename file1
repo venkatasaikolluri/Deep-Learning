@@ -1,0 +1,687 @@
+RUN CELL1 ----->
+
+
+#@title ⚙️ CELL 1 — Setup & Model Loading
+import subprocess, sys
+print("📦 Installing packages...")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                "ultralytics", "Pillow", "numpy", "matplotlib", "ipywidgets"],
+               capture_output=True)
+
+print("🔄 Importing libraries...")
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import FancyBboxPatch
+from PIL import Image, ImageDraw
+import math, warnings, io
+from collections import defaultdict
+from datetime import datetime
+warnings.filterwarnings("ignore")
+from ultralytics import YOLO
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+
+# ══════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
+class Config:
+    DET_MODEL   = "yolov8l.pt"
+    POSE_MODEL  = "yolov8l-pose.pt"
+    IMAGE_SIZE  = 960
+
+    BASE_CONF    = 0.10
+    STANDARD_CONF = 0.35
+    WEAPON_CONF  = 0.12
+    PERSON_CONF  = 0.12
+
+    RISK_CATEGORIES = {
+        "weapon": {"items": ["knife","scissors","gun","rifle"],       "score": 10, "level": "CRITICAL"},
+        "sharp":  {"items": ["fork"],                                  "score": 3,  "level": "LOW"},
+        "blunt":  {"items": ["bottle","baseball bat","sports ball"],  "score": 5,  "level": "MEDIUM"},
+        "fire":   {"items": ["fire hydrant","oven","toaster"],        "score": 6,  "level": "MEDIUM"},
+        "safe":   {"items": ["cell phone","laptop","book","cup","chair","spoon",
+                              "bowl","dining table","microwave","refrigerator",
+                              "sink","handbag","backpack","umbrella"],
+                   "score": 0, "level": "SAFE"},
+    }
+
+    SCENE_CONTEXT = {
+        "kitchen":  {"microwave","oven","toaster","refrigerator","sink","bowl","spoon","fork","cup","bottle"},
+        "dining":   {"dining table","chair","fork","spoon","wine glass","cup","bowl","bottle"},
+        "office":   {"laptop","keyboard","mouse","monitor","cell phone","book","chair"},
+        "sports":   {"sports ball","baseball bat","tennis racket","frisbee","skateboard"},
+        "outdoor":  {"bicycle","car","truck","bench","traffic light","handbag","backpack"},
+    }
+
+    CONTEXT_MODIFIER = {
+        "kitchen": 0.55, "dining": 0.60, "office": 0.80,
+        "sports":  0.75, "outdoor": 0.90, "unknown": 1.00,
+    }
+
+    VERY_CLOSE = 120
+    CLOSE      = 220
+    NEARBY     = 380
+
+    # Normalised risk thresholds (0-100)
+    THRESH_CRITICAL = 70
+    THRESH_HIGH     = 45
+    THRESH_MEDIUM   = 25
+    THRESH_LOW      = 10
+
+    RISK_COLORS = {
+        "CRITICAL": "#DC2626",
+        "HIGH":     "#EA580C",
+        "MEDIUM":   "#F59E0B",
+        "LOW":      "#3B82F6",
+        "SAFE":     "#10B981",
+    }
+
+cfg = Config()
+
+# ══════════════════════════════════════════════════════════════════
+#  LOAD MODELS
+# ══════════════════════════════════════════════════════════════════
+print("🤖 Loading YOLOv8l Object Detection model...")
+_det_model  = YOLO(cfg.DET_MODEL)
+_det_names  = _det_model.names
+
+print("🤖 Loading YOLOv8l Pose Estimation model...")
+_pose_model = YOLO(cfg.POSE_MODEL)
+print("✅ Both models loaded!")
+
+# ══════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════
+WEAPON_CLASSES = ["knife","scissors","gun","rifle"]
+ALL_DANGEROUS  = [item for c in cfg.RISK_CATEGORIES.values() for item in c["items"]]
+
+KP = dict(
+    nose=0, left_eye=1, right_eye=2, left_ear=3, right_ear=4,
+    left_shoulder=5,  right_shoulder=6,
+    left_elbow=7,     right_elbow=8,
+    left_wrist=9,     right_wrist=10,
+    left_hip=11,      right_hip=12,
+    left_knee=13,     right_knee=14,
+    left_ankle=15,    right_ankle=16,
+)
+
+# ══════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ══════════════════════════════════════════════════════════════════
+def get_object_risk(name):
+    for cat, info in cfg.RISK_CATEGORIES.items():
+        if name in info["items"]:
+            return cat, info["score"], info["level"]
+    return "unknown", 2, "LOW"
+
+def centre(box):  return ((box[0]+box[2])/2, (box[1]+box[3])/2)
+def dist(p1,p2):  return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
+def box_area(b):  return max(0,b[2]-b[0])*max(0,b[3]-b[1])
+
+def iou(b1,b2):
+    ix1=max(b1[0],b2[0]); iy1=max(b1[1],b2[1])
+    ix2=min(b1[2],b2[2]); iy2=min(b1[3],b2[3])
+    inter=max(0,ix2-ix1)*max(0,iy2-iy1)
+    union=box_area(b1)+box_area(b2)-inter
+    return inter/(union+1e-6)
+
+def nms(dets, thresh=0.45):
+    if len(dets)<=1: return dets
+    dets=sorted(dets,key=lambda x:x["conf"],reverse=True)
+    kept=[]; sup=set()
+    for i,d in enumerate(dets):
+        if i in sup: continue
+        kept.append(d)
+        for j in range(i+1,len(dets)):
+            if j not in sup and iou(d["box"],dets[j]["box"])>thresh:
+                sup.add(j)
+    return kept
+
+# ══════════════════════════════════════════════════════════════════
+#  OBJECT DETECTION  — multi-pass
+# ══════════════════════════════════════════════════════════════════
+def _extract(results, weapon_only=False, person_only=False):
+    out=[]
+    for box in results[0].boxes:
+        cls_id=int(box.cls[0]); conf=float(box.conf[0])
+        name=_det_names[cls_id]
+        if weapon_only and name not in WEAPON_CLASSES: continue
+        if person_only and name!="person": continue
+        x1,y1,x2,y2=box.xyxy[0].tolist()
+        out.append({"cls_id":cls_id,"name":name,"conf":conf,
+                    "box":(x1,y1,x2,y2),"center":centre((x1,y1,x2,y2)),
+                    "area":(x2-x1)*(y2-y1)})
+    return out
+
+def detect_objects(pil_img):
+    img_np=np.array(pil_img)
+    r1=_det_model(img_np,imgsz=cfg.IMAGE_SIZE,conf=cfg.BASE_CONF,verbose=False)
+    dets=[]
+    for box in r1[0].boxes:
+        cls_id=int(box.cls[0]); conf=float(box.conf[0])
+        name=_det_names[cls_id]; x1,y1,x2,y2=box.xyxy[0].tolist()
+        if name in WEAPON_CLASSES    and conf<cfg.WEAPON_CONF:  continue
+        if name=="person"            and conf<cfg.PERSON_CONF:  continue
+        if name not in WEAPON_CLASSES and name!="person" and conf<cfg.STANDARD_CONF: continue
+        dets.append({"cls_id":cls_id,"name":name,"conf":conf,
+                     "box":(x1,y1,x2,y2),"center":centre((x1,y1,x2,y2)),
+                     "area":(x2-x1)*(y2-y1)})
+
+    # Pass 2 — ultra-low for weapons
+    if not [d for d in dets if d["name"] in WEAPON_CLASSES]:
+        r2=_det_model(img_np,imgsz=cfg.IMAGE_SIZE,conf=0.05,verbose=False)
+        extra=_extract(r2,weapon_only=True)
+        if extra: dets+=extra; print("  [Pass 2] Weapon at ultra-low conf.")
+
+    # Pass 3 — multi-scale
+    if not [d for d in dets if d["name"] in WEAPON_CLASSES]:
+        for sz in [640,1280]:
+            r3=_det_model(img_np,imgsz=sz,conf=0.05,verbose=False)
+            extra=_extract(r3,weapon_only=True)
+            if extra: dets+=extra; print(f"  [Pass 3] Weapon at scale {sz}."); break
+
+    # Pass 4 — person retry
+    persons=[d for d in dets if d["name"]=="person"]
+    if len(persons)<2:
+        r4=_det_model(img_np,imgsz=cfg.IMAGE_SIZE,conf=0.08,verbose=False)
+        ep=nms(_extract(r4,person_only=True),0.40)
+        for p in ep:
+            if not any(iou(p["box"],ex["box"])>0.40 for ex in persons):
+                dets.append(p); persons.append(p)
+
+    by_cls=defaultdict(list)
+    for d in dets: by_cls[d["name"]].append(d)
+    cleaned=[]
+    for cls_name,cls_dets in by_cls.items():
+        cleaned+=nms(cls_dets, 0.45 if cls_name=="person" else 0.50)
+    return cleaned
+
+# ══════════════════════════════════════════════════════════════════
+#  POSE ESTIMATION
+# ══════════════════════════════════════════════════════════════════
+def detect_poses(pil_img):
+    img_np=np.array(pil_img)
+    results=_pose_model(img_np,imgsz=cfg.IMAGE_SIZE,conf=0.15,verbose=False)[0]
+    poses=[]
+    if results.keypoints is not None:
+        kp_xy  = results.keypoints.xy.cpu().numpy()
+        kp_conf= results.keypoints.conf
+        kp_conf_np = kp_conf.cpu().numpy() if kp_conf is not None else None
+        for i,kps in enumerate(kp_xy):
+            confs = kp_conf_np[i] if kp_conf_np is not None else np.ones(17)
+            poses.append({"keypoints":kps,"confs":confs})
+    return poses
+
+# ══════════════════════════════════════════════════════════════════
+#  POSE AGGRESSION ANALYSIS  — enhanced
+#
+#  Scores each person on three metrics:
+#    1. RAISED ARM   — wrist significantly above shoulder (attack-ready)
+#    2. EXTENDED ARM — arm length > 85% of torso (reaching/lunging)
+#    3. FORWARD THRUST — wrist well ahead of elbow in x-axis (punch/stab)
+#    4. ASYMMETRIC POSTURE — one arm raised, other down (striking pose)
+#
+#  Returns per-person score 0-1 and per-scene max aggression score.
+#  The max-person score drives the final pose contribution (0-50 pts).
+#  This ensures a single aggressive person raises the overall risk.
+# ══════════════════════════════════════════════════════════════════
+def arm_aggression_score(pose):
+    """
+    Comprehensive aggression scoring using 6 signals.
+    Lowered thresholds to catch fighting/punching poses
+    where arms may not be fully raised above shoulder.
+
+    Signals:
+      1. Raised arm      — wrist above shoulder
+      2. Bent attack arm — elbow significantly higher than wrist (punching position)
+      3. Extended arm    — arm length vs torso ratio
+      4. Forward thrust  — wrist ahead of elbow in x-axis
+      5. Wide stance     — shoulder width vs hip width (aggressive spread)
+      6. Asymmetric pose — one arm up, one down (striking)
+    """
+    kps=pose["keypoints"]; cfs=pose["confs"]
+    def valid(i): return kps[i][0]>0 and kps[i][1]>0 and cfs[i]>0.20
+
+    score=0.0; checks=0; details=[]
+    per_side={}
+
+    for side,prefix in [
+        (("left_shoulder","left_elbow","left_wrist","left_hip"),"left"),
+        (("right_shoulder","right_elbow","right_wrist","right_hip"),"right")
+    ]:
+        sh,el,wr,hp=[KP[k] for k in side]
+        if not all(valid(i) for i in [sh,el,wr]): continue
+        checks+=1; ss=0.0
+
+        # ── Signal 1: Raised arm (wrist above shoulder) ──
+        raise_amount = kps[sh][1] - kps[wr][1]
+        if raise_amount > 10:
+            ss += 0.50; details.append(f"{prefix} arm raised")
+        elif raise_amount > 0:
+            ss += 0.20
+
+        # ── Signal 2: Bent attack arm (elbow above wrist — punching) ──
+        # In a punch, elbow is pulled back+up while fist is forward
+        elbow_above_wrist = kps[el][1] - kps[wr][1]   # +ve = elbow lower than wrist
+        wrist_forward = abs(kps[wr][0] - kps[sh][0])
+        if elbow_above_wrist < -15 and wrist_forward > 20:
+            # elbow is HIGHER than wrist = cocked/punching arm
+            ss += 0.45; details.append(f"{prefix} punch/attack position")
+        elif elbow_above_wrist < -5:
+            ss += 0.20
+
+        # ── Signal 3: Extended arm (arm length vs torso) ──
+        if valid(hp):
+            torso   = dist(kps[sh],kps[hp])
+            arm_len = dist(kps[sh],kps[wr])
+            if torso > 5:
+                ratio = arm_len / torso
+                if ratio > 0.80:   ss += 0.40; details.append(f"{prefix} arm extended")
+                elif ratio > 0.60: ss += 0.18
+
+        # ── Signal 4: Forward thrust (wrist well beyond elbow in x) ──
+        elbow_off = abs(kps[el][0] - kps[sh][0])
+        wrist_off = abs(kps[wr][0] - kps[sh][0])
+        if elbow_off > 3 and wrist_off / (elbow_off + 1e-6) > 1.15:
+            ss += 0.28; details.append(f"{prefix} forward thrust")
+
+        per_side[prefix] = ss
+        score += ss
+
+    # ── Signal 5: Asymmetric striking pose ──
+    if checks == 2:
+        lsh=KP["left_shoulder"]; rsh=KP["right_shoulder"]
+        lwr=KP["left_wrist"];    rwr=KP["right_wrist"]
+        if all(valid(i) for i in [lsh,rsh,lwr,rwr]):
+            left_raise  = kps[lsh][1] - kps[lwr][1]
+            right_raise = kps[rsh][1] - kps[rwr][1]
+            asymmetry = abs(left_raise - right_raise)
+            if asymmetry > 25 and (left_raise > 5 or right_raise > 5):
+                score += 0.45; details.append("asymmetric striking posture")
+
+    # ── Signal 6: Wide aggressive stance (shoulders spread relative to hips) ──
+    lsh=KP["left_shoulder"]; rsh=KP["right_shoulder"]
+    lhp=KP["left_hip"];      rhp=KP["right_hip"]
+    if all(valid(i) for i in [lsh,rsh,lhp,rhp]):
+        shoulder_w = abs(kps[lsh][0]-kps[rsh][0])
+        hip_w      = abs(kps[lhp][0]-kps[rhp][0])
+        if hip_w > 5 and shoulder_w / hip_w > 1.35:
+            score += 0.25; details.append("wide aggressive stance")
+
+    norm = min(score / max(checks * 1.4, 1), 1.0)
+    return norm, list(set(details))
+
+def compute_scene_aggression(poses):
+    """
+    Returns (max_score, avg_score, aggressive_count, all_details).
+    Aggressive threshold lowered to 0.25 to catch punching/fighting poses.
+    """
+    if not poses: return 0.0, 0.0, 0, []
+    scores=[arm_aggression_score(p) for p in poses]
+    vals=[s for s,_ in scores]
+    details=[d for _,ds in scores for d in ds]
+    aggressive_count=sum(1 for v in vals if v>0.25)
+    return max(vals), sum(vals)/len(vals), aggressive_count, list(set(details))
+
+# ══════════════════════════════════════════════════════════════════
+#  SCENE CONTEXT
+# ══════════════════════════════════════════════════════════════════
+def infer_scene(detections):
+    names={d["name"].lower() for d in detections}
+    scores={scene:len(names&objs) for scene,objs in cfg.SCENE_CONTEXT.items()}
+    best=max(scores,key=scores.get)
+    return best if scores[best]>0 else "unknown"
+
+# ══════════════════════════════════════════════════════════════════
+#  VISUAL HEURISTICS  (PIL only)
+# ══════════════════════════════════════════════════════════════════
+def _blade_heuristic(pil_img):
+    SCALE=0.3
+    small=pil_img.resize((int(pil_img.width*SCALE),int(pil_img.height*SCALE)),Image.LANCZOS)
+    arr=np.array(small,dtype=np.float32)
+    R,G,B=arr[:,:,0],arr[:,:,1],arr[:,:,2]
+    bright=(R+G+B)/3.0
+    cmax=np.maximum(np.maximum(R,G),B); cmin=np.minimum(np.minimum(R,G),B)
+    sat=(cmax-cmin)/(cmax+1e-6)
+    mask=((bright>70)&(bright<235)&(sat<0.28)).astype(np.float32)
+    gy=np.abs(np.diff(bright,axis=0,prepend=bright[:1,:]))
+    gx=np.abs(np.diff(bright,axis=1,prepend=bright[:,:1]))
+    combined=mask*(1.0+(gy+gx)/2.0/60.0)
+    hot=combined>np.percentile(combined,90)
+    rows=np.any(hot,axis=1); cols=np.any(hot,axis=0)
+    if not rows.any() or not cols.any(): return False,[0,0,1,1],0.0
+    rmin,rmax=np.where(rows)[0][[0,-1]]
+    cmin_c,cmax_c=np.where(cols)[0][[0,-1]]
+    rh=rmax-rmin; rw=cmax_c-cmin_c; sh_s,sw_s=hot.shape
+    aspect=max(rh,rw)/(min(rh,rw)+1e-6)
+    area_frac=(rh*rw)/(sh_s*sw_s)
+    density=hot[rmin:rmax+1,cmin_c:cmax_c+1].mean()
+    conf=0.0
+    if aspect>2.0: conf+=0.35
+    if aspect>3.5: conf+=0.20
+    if density>0.35: conf+=0.25
+    if 0.02<area_frac<0.45: conf+=0.20
+    inv=1.0/SCALE
+    box=[int(cmin_c*inv),int(rmin*inv),int(cmax_c*inv),int(rmax*inv)]
+    return conf>=0.45, box, min(conf,0.95)
+
+def _grip_heuristic(pil_img):
+    SCALE=0.3
+    small=pil_img.resize((int(pil_img.width*SCALE),int(pil_img.height*SCALE)),Image.LANCZOS)
+    arr=np.array(small,dtype=np.float32)
+    R,G,B=arr[:,:,0],arr[:,:,1],arr[:,:,2]
+    skin=((R>95)&(G>40)&(B>20)&(R>G)&(R>B)&
+          ((R-G)>15)&(np.abs(R.astype(int)-G.astype(int))>15)).astype(np.float32)
+    dark=((R<60)&(G<60)&(B<60)).astype(np.float32)
+    sf=skin.mean(); df=dark.mean()
+    c=0.0
+    if sf>0.04: c+=0.40
+    if sf>0.08: c+=0.20
+    if df>0.05: c+=0.20
+    if sf>0.03 and df>0.03: c+=0.20
+    return min(c,1.0)
+
+# ══════════════════════════════════════════════════════════════════
+#  INTERACTION ANALYSIS
+# ══════════════════════════════════════════════════════════════════
+def analyze_interactions(persons, objects, img_w, img_h):
+    img_diag=math.hypot(img_w,img_h)
+    interactions=[]; reasons=[]; interaction_score=0.0
+
+    for wpn in [o for o in objects if o["name"] in WEAPON_CLASSES]:
+        p_dists=sorted([(dist(wpn["center"],p["center"]),p) for p in persons],
+                       key=lambda x:x[0])
+        if not p_dists:
+            interaction_score+=10
+            reasons.append(f"{wpn['name'].capitalize()} detected — no person nearby.")
+            continue
+        d0,closest=p_dists[0]; norm_d=d0/img_diag
+        if norm_d<0.12:   pts=55; prox="CONTACT — weapon held by person"
+        elif norm_d<0.25: pts=38; prox="VERY CLOSE — within arm's reach"
+        elif norm_d<0.45: pts=20; prox="NEARBY — same zone as person"
+        else:             pts=6;  prox="DISTANT"
+        interaction_score+=pts
+        reasons.append(f"{wpn['name'].capitalize()}: {prox} (dist={norm_d:.2f}).")
+        if len(p_dists)>=2 and p_dists[1][0]/img_diag<0.35:
+            interaction_score+=30
+            reasons.append("Weapon close to TWO people — attack scenario flagged.")
+            interactions.append({"type":"two_person_attack","weapon":wpn,
+                                  "person1":closest,"person2":p_dists[1][1]})
+        interactions.append({"type":"weapon_person","weapon":wpn,
+                              "person":closest,"norm_dist":norm_d,"pts":pts})
+
+    for obj in [o for o in objects if o["name"] not in WEAPON_CLASSES]:
+        cat,base_risk,_=get_object_risk(obj["name"])
+        if cat=="safe" or not persons: continue
+        d0=min(dist(obj["center"],p["center"]) for p in persons)
+        if d0>cfg.NEARBY: continue
+        if d0<cfg.VERY_CLOSE:   pts=int(base_risk*1.3)
+        elif d0<cfg.CLOSE:      pts=int(base_risk*0.9)
+        else:                   pts=int(base_risk*0.4)
+        interaction_score+=pts
+        reasons.append(f"{obj['name'].capitalize()} ({cat}) near person — +{pts} pts.")
+
+    return interaction_score, interactions, reasons
+
+# ══════════════════════════════════════════════════════════════════
+#  NORMALISED RISK SCORING  (0-100)
+#
+#  Score components:
+#    A. Interaction score   — weapon proximity, attack patterns   (0-100 raw)
+#    B. Pose score          — aggression from keypoints           (0-50 pts)
+#         = max_person_score * 50
+#    C. Crowd aggression    — multiple people with raised arms    (0-20 pts)
+#         = aggressive_count * 4 (capped at 20)
+#
+#  Total raw max ≈ 170.  Normalise to 0-100.
+#  Context modifier applied AFTER, with hard floors for genuine threats.
+# ══════════════════════════════════════════════════════════════════
+def compute_final_score(interaction_score, max_pose, avg_pose,
+                        aggressive_count, scene, persons, objects):
+    """
+    Normalised scoring 0-100.
+
+    Pose contribution is mapped DIRECTLY to a 0-100 sub-score
+    before combining, so the final value is intuitive:
+      - max_pose=0.30 (mild) → pose_sub=30
+      - max_pose=0.60 (fight)→ pose_sub=60
+      - max_pose=1.00 (max)  → pose_sub=100
+
+    Final = weighted average:
+      50% interaction_score (0-100)
+      35% pose_sub          (0-100)
+      15% crowd_sub         (0-100)
+
+    Context modifier shrinks benign scenes.
+    Hard floors prevent genuine fights from scoring SAFE.
+    """
+    # Map each component to its own 0-100 sub-score
+    pose_sub  = min(max_pose * 100.0, 100.0)
+    crowd_sub = min(aggressive_count * 20.0, 100.0)
+
+    has_weapon = bool([o for o in objects if o["name"] in WEAPON_CLASSES])
+
+    # Weighted combination
+    if has_weapon:
+        # Weapon present: interaction dominates
+        raw = interaction_score * 0.55 + pose_sub * 0.30 + crowd_sub * 0.15
+    else:
+        # No weapon: pose is the primary signal
+        raw = interaction_score * 0.25 + pose_sub * 0.55 + crowd_sub * 0.20
+
+    modifier = cfg.CONTEXT_MODIFIER[scene]
+    adjusted = raw * modifier
+
+    # ── Hard floors: weapon contact (never let context wipe out real danger) ──
+    if interaction_score >= 55:   adjusted = max(adjusted, 60.0)
+    elif interaction_score >= 38: adjusted = max(adjusted, 45.0)
+
+    # ── Hard floors: pose-only (fighting must NOT score SAFE/LOW) ──
+    if max_pose >= 0.70:          adjusted = max(adjusted, 55.0)  # → HIGH
+    elif max_pose >= 0.50:        adjusted = max(adjusted, 40.0)  # → MEDIUM
+    elif max_pose >= 0.30:        adjusted = max(adjusted, 26.0)  # → LOW-MEDIUM
+
+    # ── Group fight floor ──
+    if aggressive_count >= 2:     adjusted = max(adjusted, 38.0)
+    if aggressive_count >= 1 and max_pose >= 0.25:
+                                  adjusted = max(adjusted, 20.0)
+
+    final = round(min(adjusted, 100.0), 1)
+
+    if   final >= cfg.THRESH_CRITICAL: level,col="CRITICAL","#DC2626"
+    elif final >= cfg.THRESH_HIGH:     level,col="HIGH",    "#EA580C"
+    elif final >= cfg.THRESH_MEDIUM:   level,col="MEDIUM",  "#F59E0B"
+    elif final >= cfg.THRESH_LOW:      level,col="LOW",     "#3B82F6"
+    else:                              level,col="SAFE",    "#10B981"
+
+    return final, level, col
+
+# ══════════════════════════════════════════════════════════════════
+#  ANNOTATED IMAGE  (PIL only)
+# ══════════════════════════════════════════════════════════════════
+def draw_annotated(pil_img, persons, objects, poses,
+                   pose_scores=None, blade_box=None, heuristic=False):
+    img=pil_img.copy().convert("RGB")
+    draw=ImageDraw.Draw(img)
+    SKELETON=[
+        (KP["left_shoulder"],KP["left_elbow"]),
+        (KP["left_elbow"],   KP["left_wrist"]),
+        (KP["right_shoulder"],KP["right_elbow"]),
+        (KP["right_elbow"],  KP["right_wrist"]),
+        (KP["left_shoulder"],KP["right_shoulder"]),
+        (KP["left_shoulder"],KP["left_hip"]),
+        (KP["right_shoulder"],KP["right_hip"]),
+    ]
+    for pi,pose in enumerate(poses):
+        kps=pose["keypoints"]; cfs=pose["confs"]
+        ps=pose_scores[pi] if pose_scores else 0.0
+        # Colour skeleton by aggression: green=calm, yellow=moderate, red=aggressive
+        if ps>0.60:   sk_col=(239,68,68)
+        elif ps>0.30: sk_col=(251,191,36)
+        else:         sk_col=(34,197,94)
+        for a,b in SKELETON:
+            if kps[a][0]>0 and kps[b][0]>0 and cfs[a]>0.25 and cfs[b]>0.25:
+                draw.line([tuple(kps[a]),tuple(kps[b])],fill=sk_col,width=2)
+        for i,(x,y) in enumerate(kps):
+            if x>0 and y>0 and cfs[i]>0.25:
+                r=4; draw.ellipse([x-r,y-r,x+r,y+r],fill=sk_col)
+
+    for det in persons:
+        x1,y1,x2,y2=[int(v) for v in det["box"]]
+        draw.rectangle([x1,y1,x2,y2],outline=(99,179,237),width=3)
+        lbl=f"person {det['conf']:.0%}"
+        draw.rectangle([x1,y1-18,x1+len(lbl)*7,y1],fill=(99,179,237))
+        draw.text((x1+3,y1-16),lbl,fill=(255,255,255))
+
+    for det in objects:
+        x1,y1,x2,y2=[int(v) for v in det["box"]]
+        col=(239,68,68) if det["name"] in WEAPON_CLASSES else (251,146,60)
+        draw.rectangle([x1,y1,x2,y2],outline=col,width=3)
+        lbl=f"{det['name']} {det['conf']:.0%}"
+        draw.rectangle([x1,y1-18,x1+len(lbl)*7,y1],fill=col)
+        draw.text((x1+3,y1-16),lbl,fill=(255,255,255))
+
+    if heuristic and blade_box:
+        bx1,by1,bx2,by2=blade_box
+        draw.rectangle([bx1,by1,bx2,by2],outline=(255,165,0),width=3)
+        lbl="knife [visual]"
+        draw.rectangle([bx1,by1-18,bx1+len(lbl)*7,by1],fill=(255,165,0))
+        draw.text((bx1+3,by1-16),lbl,fill=(0,0,0))
+    return img
+
+# ══════════════════════════════════════════════════════════════════
+#  DASHBOARD
+# ══════════════════════════════════════════════════════════════════
+def render_dashboard(pil_img, persons, objects, poses, pose_scores,
+                     total_score, risk_level, risk_color, scene,
+                     interact_score, pose_pts, aggressive_count,
+                     interact_reasons, pose_details,
+                     blade_box=None, heuristic=False,
+                     img_conf=None, conf_notes=None):
+
+    matplotlib.rcParams.update({"font.family":"DejaVu Sans"})
+    RC=cfg.RISK_COLORS
+    BG="#0f0f14"; CARD="#1a1a24"; BORD="#2a2a3a"; TXT="#e2e8f0"; DIM="#e2e8f0"
+
+    annotated=draw_annotated(pil_img,persons,objects,poses,pose_scores,blade_box,heuristic)
+
+    fig=plt.figure(figsize=(22,13),facecolor=BG)
+    fig.patch.set_facecolor(BG)
+    gs=GridSpec(3,4,figure=fig,left=0.02,right=0.98,
+                top=0.93,bottom=0.03,wspace=0.30,hspace=0.40)
+
+    fig.text(0.02,0.968,"PicDetect — AI Context-Aware Risk Detection System",
+             fontsize=16,fontweight="bold",color=TXT,va="top")
+    fig.text(0.98,0.968,"YOLOv8l Detection + Pose Estimation | No OpenCV",
+             fontsize=9,color=DIM,va="top",ha="right")
+    fig.add_artist(plt.Line2D([0.02,0.98],[0.950,0.950],
+                               transform=fig.transFigure,color=BORD,linewidth=1))
+
+    # ── Annotated image ──
+    ax1=fig.add_subplot(gs[:,0:2])
+    ax1.set_facecolor(BG)
+    ax1.set_title("Scene Analysis — Detections & Colour-Coded Pose Skeleton\n"
+                  "Green=Calm  Yellow=Moderate  Red=Aggressive",
+                  color=DIM,fontsize=10,pad=8)
+    ax1.imshow(annotated); ax1.axis("off")
+
+    # ── Risk gauge ──
+    ax2=fig.add_subplot(gs[0,2:])
+    ax2.set_facecolor(CARD); ax2.set_xlim(0,10); ax2.set_ylim(0,10); ax2.axis("off")
+    ax2.add_patch(FancyBboxPatch((0.1,0.1),9.8,9.8,boxstyle="round,pad=0.15",
+                                  linewidth=2,edgecolor=risk_color,facecolor=CARD))
+    ax2.text(5,7.5,str(total_score),fontsize=56,fontweight="bold",
+             color=risk_color,ha="center",va="center")
+    ax2.text(5,5.0,"/ 100",fontsize=14,color=DIM,ha="center",va="center")
+    ax2.text(5,3.3,risk_level,fontsize=24,fontweight="bold",
+             color=risk_color,ha="center",va="center")
+    ax2.text(5,1.8,"RISK LEVEL",fontsize=9,color=DIM,ha="center",fontweight="bold")
+    bw=8.0; bx=1.0; by=0.6; bh=0.8
+    ax2.add_patch(FancyBboxPatch((bx,by),bw,bh,boxstyle="round,pad=0.05",
+                                  facecolor="#1e293b",edgecolor="none"))
+    filled=bw*total_score/100
+    if filled>0.1:
+        ax2.add_patch(FancyBboxPatch((bx,by),filled,bh,boxstyle="round,pad=0.05",
+                                      facecolor=risk_color,edgecolor="none"))
+    ax2.set_title("Normalised Risk Score (0–100)",color=DIM,fontsize=10,pad=6)
+
+    # ── Scene intelligence ──
+    ax3=fig.add_subplot(gs[1,2:])
+    ax3.set_facecolor(CARD); ax3.set_xlim(0,10); ax3.set_ylim(0,10); ax3.axis("off")
+    ax3.add_patch(FancyBboxPatch((0.1,0.1),9.8,9.8,boxstyle="round,pad=0.15",
+                                  linewidth=1,edgecolor=BORD,facecolor=CARD))
+    ax3.set_title("Scene Intelligence",color=DIM,fontsize=10,pad=6)
+
+    # ── Per-image confidence badge inside risk gauge ──
+    if img_conf is not None:
+        conf_col = "#22c55e" if img_conf>=80 else "#f59e0b" if img_conf>=60 else "#ef4444"
+        ax2.text(5, 0.15, f"Image Confidence: {img_conf}%",
+                 fontsize=8, color=conf_col, ha="center", va="bottom",
+                 fontweight="bold")
+
+    sc_col={"kitchen":"#f97316","dining":"#a855f7","office":"#3b82f6",
+             "sports":"#22c55e","outdoor":"#06b6d4","unknown":"#6b7280"}
+    ax3.add_patch(FancyBboxPatch((0.3,7.8),4.0,1.2,boxstyle="round,pad=0.1",
+                                  facecolor=sc_col.get(scene,"#6b7280"),alpha=0.9,edgecolor="none"))
+    ax3.text(2.3,8.4,f"SCENE: {scene.upper()}",fontsize=10,fontweight="bold",
+             color="white",ha="center",va="center")
+    mod_pct=int((1-cfg.CONTEXT_MODIFIER[scene])*100)
+    ax3.text(7.5,8.4,f"Modifier: -{mod_pct}%",fontsize=9,color=DIM,ha="center",va="center")
+
+    wpn_names=", ".join(d["name"] for d in objects if d["name"] in WEAPON_CLASSES) or "None"
+    other_names=", ".join(d["name"] for d in objects if d["name"] not in WEAPON_CLASSES)
+    if len(other_names)>30: other_names=other_names[:28]+"..."
+    rows=[
+        ("Weapons Found",      wpn_names),
+        ("Other Objects",      other_names or "None"),
+        ("Pose Sessions",      str(len(poses))),
+        ("Interaction Score",  f"{interact_score:.1f} pts"),
+        ("Pose Score",         f"{pose_pts:.1f} / 50 pts"),
+    ]
+    for i,(k,v) in enumerate(rows):
+        yp=7.2-i*0.98
+        ax3.text(0.4,yp,k,fontsize=8,color=DIM,va="center",fontweight="bold")
+        ax3.text(9.6,yp,v,fontsize=8,color=TXT,va="center",ha="right")
+        if i<len(rows)-1:
+            ax3.axhline(yp-0.44,xmin=0.04,xmax=0.96,color=BORD,linewidth=0.4)
+
+    # ── AI Reasoning ──
+    ax4=fig.add_subplot(gs[2,2:])
+    ax4.set_facecolor(CARD); ax4.set_xlim(0,10); ax4.set_ylim(0,10); ax4.axis("off")
+    ax4.add_patch(FancyBboxPatch((0.1,0.1),9.8,9.8,boxstyle="round,pad=0.15",
+                                  linewidth=1,edgecolor=BORD,facecolor=CARD))
+    ax4.set_title("AI Reasoning & Explanation",color=DIM,fontsize=10,pad=6)
+    all_reasons=interact_reasons+pose_details
+    if scene!="unknown":
+        all_reasons.append(f"Context '{scene}' reduces risk by ~{mod_pct}%.")
+    if img_conf is not None:
+        all_reasons.append(f"Image confidence: {img_conf}% (per-image estimate).")
+    all_reasons=all_reasons[:6]
+    step=9.0/max(len(all_reasons),1)
+    high_kw=["critical","attack","contact","very close","raised","extended","thrust","aggressive"]
+    for i,r in enumerate(all_reasons):
+        yp=9.2-i*step
+        txt=r if len(r)<=70 else r[:67]+"..."
+        col=risk_color if any(w in r.lower() for w in high_kw) else TXT
+        ax4.text(0.4,yp,f"• {txt}",fontsize=8.0,color=col,va="top")
+
+    # Risk level strip
+    ax5=fig.add_axes([0.525,0.005,0.46,0.022])
+    ax5.set_facecolor(BG); ax5.set_xlim(0,5); ax5.set_ylim(0,1); ax5.axis("off")
+    for i,(lv,c) in enumerate(RC.items()):
+        ax5.add_patch(patches.Rectangle((i,0),1,1,facecolor=c,alpha=0.85))
+        ax5.text(i+0.5,0.5,lv,ha="center",va="center",fontsize=7.5,
+                 color="white",fontweight="bold")
+
+    fig.text(0.98,0.002,f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             ha="right",va="bottom",fontsize=7,style="italic",color=DIM)
+    plt.tight_layout()
+    plt.savefig("/tmp/_picdetect.png",dpi=130,bbox_inches="tight",facecolor=BG)
+    plt.show(); plt.close(fig)
+    print("✅ Dashboard generated!")
+
+print("\n🎉 Setup complete — run Cell 2!")
+
