@@ -1,0 +1,225 @@
+INTERACTIVE RISK ANALYSIS Cell2
+Environment : google colab
+
+-------cell2----------
+
+
+#@title 🚀 CELL 2 — Interactive Risk Analysis
+from IPython.display import display, clear_output, HTML
+import ipywidgets as widgets
+from PIL import Image
+import io
+
+header="""
+<style>
+.go-btn button {
+  background:linear-gradient(135deg,#DC2626,#7c3aed)!important;
+  color:white!important;font-weight:bold!important;
+  border:none!important;border-radius:8px!important;
+  font-size:15px!important;padding:10px 32px!important;
+}
+</style>
+<div style="background:#0f0f14;border:1px solid #334155;border-radius:14px;
+            padding:20px 28px;margin-bottom:14px;">
+  <h2 style="color:#e2e8f0;font-family:monospace;margin:0 0 6px 0;">
+    PicDetect — AI Risk Detection System</h2>
+  <p style="color:#e2e8f0;font-family:monospace;font-size:13px;margin:0;">
+    YOLOv8l Object Detection + Pose Estimation + Context-Aware Scoring</p>
+  <p style="color:#475569;font-family:monospace;font-size:11px;margin:6px 0 0 0;">
+    Upload an image then click ANALYSE RISK to view the full dashboard</p>
+</div>
+"""
+display(HTML(header))
+
+uploader = widgets.FileUpload(accept="image/*", multiple=False,
+                              description="Upload Image",
+                              layout=widgets.Layout(width="270px"))
+btn = widgets.Button(description="ANALYSE RISK",
+                     layout=widgets.Layout(width="210px", height="44px"))
+btn.add_class("go-btn")
+status_out = widgets.Output()
+result_out  = widgets.Output()
+
+
+def _calc_image_confidence(persons, objects, poses, scene, heuristic_used):
+    """
+    Per-image confidence score (0-100).
+    Reflects how reliably THIS image was analysed based on
+    detection quality, keypoint coverage, scene clarity, etc.
+    Different for every image — not a fixed system metric.
+    """
+    factors = []
+    notes   = []
+
+    # 1. Person detection confidence (25%)
+    if persons:
+        avg_pc = sum(p["conf"] for p in persons) / len(persons)
+        factors.append(avg_pc * 100)
+        notes.append(f"Person detection avg conf: {avg_pc*100:.1f}%")
+    else:
+        factors.append(40.0)
+        notes.append("No persons detected: confidence 40%")
+
+    # 2. Weapon/object detection confidence (25%)
+    w_dets = [o for o in objects if o["name"] in WEAPON_CLASSES]
+    if w_dets:
+        avg_wc = sum(w["conf"] for w in w_dets) / len(w_dets)
+        factors.append(avg_wc * 100)
+        notes.append(f"Weapon detection conf: {avg_wc*100:.1f}%")
+    elif poses:
+        factors.append(75.0)
+        notes.append("No weapon detected — pose-based analysis: 75%")
+    else:
+        factors.append(50.0)
+        notes.append("No weapon, no pose — limited signals: 50%")
+
+    # 3. Pose keypoint coverage (20%)
+    if poses:
+        total_kp = sum(
+            sum(1 for x, y in p["keypoints"] if x > 0 and y > 0)
+            for p in poses
+        )
+        kp_ratio = total_kp / (len(poses) * 17)
+        factors.append(kp_ratio * 100)
+        notes.append(f"Pose keypoint coverage: {kp_ratio*100:.1f}%")
+    else:
+        factors.append(50.0)
+        notes.append("No pose detected: 50%")
+
+    # 4. Scene context clarity (15%)
+    if scene != "unknown":
+        factors.append(92.0)
+        notes.append(f"Scene '{scene}' identified: 92%")
+    else:
+        factors.append(65.0)
+        notes.append("Scene unknown: 65%")
+
+    # 5. Detection method (15%) — heuristic is less reliable than YOLO
+    if heuristic_used:
+        factors.append(70.0)
+        notes.append("Blade heuristic used (YOLO missed): 70%")
+    else:
+        factors.append(95.0)
+        notes.append("YOLO detection (no heuristic needed): 95%")
+
+    weights  = [0.25, 0.25, 0.20, 0.15, 0.15]
+    img_conf = round(min(sum(f * w for f, w in zip(factors, weights)), 100.0), 1)
+    return img_conf, notes
+
+
+def on_click(b):
+    btn.disabled = True
+    with result_out:
+        clear_output(wait=True)
+    with status_out:
+        clear_output(wait=True)
+        print("Running analysis... please wait.")
+
+    try:
+        if not uploader.value:
+            with status_out:
+                clear_output(wait=True)
+                print("Please upload an image first.")
+            btn.disabled = False
+            return
+
+        uploaded_file = list(uploader.value.values())[0]
+        pil_img = Image.open(io.BytesIO(bytes(uploaded_file["content"]))).convert("RGB")
+        MAX_DIM = 1280
+        w, h = pil_img.size
+        if max(w, h) > MAX_DIM:
+            scale = MAX_DIM / max(w, h)
+            pil_img = pil_img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+        img_w, img_h = pil_img.size
+
+        # Step 1: Object detection
+        detections = detect_objects(pil_img)
+        persons    = [d for d in detections if d["name"] == "person"]
+        objects    = [d for d in detections if d["name"] != "person"]
+
+        # Step 2: Pose estimation
+        poses = detect_poses(pil_img)
+
+        # Step 3: Scene context
+        scene = infer_scene(detections)
+
+        # Step 4: Visual heuristic fallback
+        blade_found, blade_box, _ = _blade_heuristic(pil_img)
+        grip_conf = _grip_heuristic(pil_img)
+        heuristic_used = False
+        if not [o for o in objects if o["name"] in WEAPON_CLASSES]:
+            if blade_found and grip_conf > 0.45:
+                objects.append({
+                    "cls_id": -1, "name": "knife",
+                    "conf": round(grip_conf * 0.9, 2),
+                    "box": tuple(blade_box),
+                    "center": ((blade_box[0]+blade_box[2])/2,
+                               (blade_box[1]+blade_box[3])/2),
+                    "area": (blade_box[2]-blade_box[0])*(blade_box[3]-blade_box[1]),
+                })
+                heuristic_used = True
+
+        # Step 5: Interaction analysis
+        interact_score, interactions, interact_reasons = analyze_interactions(
+            persons, objects, img_w, img_h)
+
+        # Step 6: Pose aggression
+        max_pose, avg_pose, aggressive_count, pose_details = compute_scene_aggression(poses)
+        pose_scores_list = [arm_aggression_score(p)[0] for p in poses]
+        pose_pts = max_pose * 50
+
+        if max_pose > 0.60:
+            pose_details.insert(0, f"HIGH aggression: {aggressive_count} person(s) with threatening posture.")
+        elif max_pose > 0.30:
+            pose_details.insert(0, f"Moderate aggression posture (max={max_pose:.2f}).")
+        else:
+            pose_details.insert(0, "Pose analysis: non-threatening posture.")
+
+        if not poses:
+            if grip_conf > 0.55:
+                pose_pts = grip_conf * 20
+                pose_details = ["Strong grip heuristic — aggression inferred."]
+            else:
+                pose_details = ["No human pose detected in frame."]
+
+        # Step 7: Risk score
+        total_score, risk_level, risk_color = compute_final_score(
+            interact_score, max_pose, avg_pose,
+            aggressive_count, scene, persons, objects)
+
+        # Step 8: Per-image confidence
+        img_conf, conf_notes = _calc_image_confidence(
+            persons, objects, poses, scene, heuristic_used)
+
+        with status_out:
+            clear_output(wait=True)
+            print(f"Done — {len(persons)} person(s) | scene={scene} | "
+                  f"risk={risk_level} ({total_score}/100) | "
+                  f"image confidence={img_conf}%")
+
+        with result_out:
+            render_dashboard(
+                pil_img, persons, objects, poses, pose_scores_list,
+                total_score, risk_level, risk_color, scene,
+                interact_score, round(pose_pts, 1), aggressive_count,
+                interact_reasons, pose_details,
+                blade_box if heuristic_used else None, heuristic_used,
+                img_conf, conf_notes
+            )
+
+    except Exception as e:
+        with status_out:
+            clear_output(wait=True)
+            print(f"Error: {e}")
+    finally:
+        btn.disabled = False
+
+
+btn.on_click(on_click)
+display(
+    widgets.HBox([uploader, btn]),
+    widgets.HTML("<hr style='border-color:#1e293b;margin:10px 0'>"),
+    status_out,
+    result_out,
+)
+
